@@ -1,6 +1,3 @@
-import queue
-
-import av
 import cv2
 import numpy as np
 import psycopg2
@@ -8,27 +5,10 @@ import streamlit as st
 from PIL import Image
 from psycopg2.extras import RealDictCursor
 
-WEBRTC_AVAILABLE = True
-WEBRTC_IMPORT_ERROR = None
-
-try:
-    from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
-except Exception as exc:
-    WEBRTC_AVAILABLE = False
-    WEBRTC_IMPORT_ERROR = exc
-
-FRAGMENT_DECORATOR = getattr(st, "fragment", getattr(st, "experimental_fragment", None))
-
 DUNKIN_PINK = "#E11383"
 DUNKIN_ORANGE = "#F5821F"
 DUNKIN_BROWN = "#683817"
 DUNKIN_WHITE = "#FCF6F6"
-
-RTC_CONFIGURATION = (
-    RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-    if WEBRTC_AVAILABLE
-    else None
-)
 
 st.set_page_config(page_title="Dunkin' Offers | Scanner", page_icon="🍩")
 
@@ -94,54 +74,6 @@ st.markdown(
 )
 
 
-class LiveQRProcessor:
-    def __init__(self):
-        self.detector = cv2.QRCodeDetector()
-        self.result_queue = queue.Queue()
-        self.last_sent_code = None
-
-    def recv(self, frame):
-        image = frame.to_ndarray(format="bgr24")
-        code, points = self._read_code(image)
-
-        if points is not None:
-            pts = points.astype(int).reshape((-1, 1, 2))
-            cv2.polylines(image, [pts], True, (0, 200, 0), 3)
-
-        if code:
-            cv2.putText(
-                image,
-                f"Cupom: {code}",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 200, 0),
-                2,
-                cv2.LINE_AA,
-            )
-            if code != self.last_sent_code:
-                self.result_queue.put(code)
-                self.last_sent_code = code
-
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
-
-    def _read_code(self, image):
-        try:
-            found, decoded_info, points, _ = self.detector.detectAndDecodeMulti(image)
-            if found and decoded_info:
-                for index, value in enumerate(decoded_info):
-                    code = value.strip()
-                    if code:
-                        selected_points = points[index] if points is not None else None
-                        return code, selected_points
-        except Exception:
-            pass
-
-        code, points, _ = self.detector.detectAndDecode(image)
-        clean_code = code.strip() if code else None
-        return clean_code, points
-
-
 def get_connection():
     if "neon" not in st.secrets:
         raise RuntimeError(
@@ -189,10 +121,10 @@ def get_offer_data(coupon_id):
             cur.execute(query, (coupon_id,))
             return cur.fetchone()
     except ValueError:
-        st.session_state["scan_error"] = "O QR Code precisa conter um ID numerico de cupom."
+        st.error("O QR Code precisa conter um ID numerico de cupom.")
         return None
     except Exception as exc:
-        st.session_state["scan_error"] = f"Erro ao conectar com o banco: {exc}"
+        st.error(f"Erro ao conectar com o banco: {exc}")
         return None
     finally:
         if conn is not None:
@@ -204,17 +136,6 @@ def process_qr_code(image):
     detector = cv2.QRCodeDetector()
     data, _, _ = detector.detectAndDecode(img_array)
     return data.strip() if data else None
-
-
-def handle_coupon_lookup(coupon_id):
-    st.session_state["last_coupon_id"] = str(coupon_id).strip()
-    st.session_state["offer_data"] = get_offer_data(coupon_id)
-    if st.session_state["offer_data"] is None and "scan_error" not in st.session_state:
-        st.session_state["scan_error"] = (
-            "Esse cupom nao foi encontrado, esta inativo ou o produto esta indisponivel."
-        )
-    elif st.session_state["offer_data"] is not None:
-        st.session_state.pop("scan_error", None)
 
 
 def render_offer(data):
@@ -240,96 +161,33 @@ def render_offer(data):
         """,
         unsafe_allow_html=True,
     )
+
     st.button(f"QUERO MEU {data['name'].upper()}! 🍩")
 
-
-def render_live_scanner():
-    st.write("Clique em START e aponte a camera para o QR Code.")
-    st.caption("A leitura acontece continuamente enquanto a transmissao estiver ativa.")
-
-    webrtc_ctx = webrtc_streamer(
-        key="qr-live-reader",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
-        video_processor_factory=LiveQRProcessor,
-        async_processing=True,
-    )
-
-    if not webrtc_ctx.state.playing:
-        st.caption("A leitura ao vivo comecara quando voce clicar em START.")
-        return
-
-    st.info("Lendo QR Code em tempo real...")
-
-    if not webrtc_ctx.video_processor:
-        return
-
-    latest_code = None
-    while True:
-        try:
-            latest_code = webrtc_ctx.video_processor.result_queue.get_nowait()
-        except queue.Empty:
-            break
-
-    if latest_code and latest_code != st.session_state.get("last_coupon_id"):
-        handle_coupon_lookup(latest_code)
-        st.rerun()
-
-
-if WEBRTC_AVAILABLE and FRAGMENT_DECORATOR is not None:
-    render_live_scanner = FRAGMENT_DECORATOR(run_every=0.5)(render_live_scanner)
-
-
-if "offer_data" not in st.session_state:
-    st.session_state["offer_data"] = None
-if "last_coupon_id" not in st.session_state:
-    st.session_state["last_coupon_id"] = None
 
 st.image(
     "https://upload.wikimedia.org/wikipedia/en/thumb/d/d3/Dunkin_Donuts_logo.svg/1200px-Dunkin_Donuts_logo.svg.png",
     width=180,
 )
 st.title("Ofertas Deliciosas!")
-st.write("Escaneie seu cupom para ver o desconto exclusivo.")
+st.write("Envie uma imagem com o QR Code do cupom para ver o desconto exclusivo.")
 
-if WEBRTC_AVAILABLE:
-    tab_live, tab_upload = st.tabs(["Leitura ao vivo", "Enviar imagem"])
-else:
-    tab_upload = st.container()
-    st.warning(
-        "A leitura ao vivo nao esta disponivel neste deploy. O app continuara funcionando com envio de imagem."
-    )
-    st.caption(f"Detalhe tecnico do ambiente: {type(WEBRTC_IMPORT_ERROR).__name__}")
+uploaded_img = st.file_uploader(
+    "Envie a foto do QR Code", type=["png", "jpg", "jpeg"]
+)
 
-if WEBRTC_AVAILABLE:
-    with tab_live:
-        if FRAGMENT_DECORATOR is not None:
-            render_live_scanner()
+if uploaded_img:
+    coupon_id = process_qr_code(Image.open(uploaded_img))
+    if coupon_id:
+        data = get_offer_data(coupon_id)
+        if data:
+            render_offer(data)
         else:
-            st.warning(
-                "Leitura ao vivo limitada nesta versao do Streamlit. Atualize o Streamlit para uma versao com suporte a fragments para mais estabilidade."
+            st.error(
+                "Esse cupom nao foi encontrado, esta inativo ou o produto esta indisponivel."
             )
-            render_live_scanner()
-
-with tab_upload:
-    uploaded_img = st.file_uploader(
-        "Ou envie a foto do QR Code", type=["png", "jpg", "jpeg"]
-    )
-    if uploaded_img:
-        coupon_id = process_qr_code(Image.open(uploaded_img))
-        if coupon_id:
-            handle_coupon_lookup(coupon_id)
-        else:
-            st.session_state["offer_data"] = None
-            st.session_state["scan_error"] = (
-                "Nao conseguimos ler o QR Code. Tente uma imagem mais nitida."
-            )
-
-if st.session_state.get("offer_data"):
-    render_offer(st.session_state["offer_data"])
-elif st.session_state.get("scan_error"):
-    st.error(st.session_state["scan_error"])
+    else:
+        st.warning("Nao conseguimos ler o QR Code. Tente uma imagem mais nitida.")
 
 st.markdown("---")
 st.caption("Dunkin' App | Conectado ao PostgreSQL via Neon.tech")

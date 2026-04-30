@@ -1,5 +1,4 @@
 import queue
-import time
 
 import av
 import cv2
@@ -17,6 +16,8 @@ try:
 except Exception as exc:
     WEBRTC_AVAILABLE = False
     WEBRTC_IMPORT_ERROR = exc
+
+FRAGMENT_DECORATOR = getattr(st, "fragment", getattr(st, "experimental_fragment", None))
 
 DUNKIN_PINK = "#E11383"
 DUNKIN_ORANGE = "#F5821F"
@@ -142,11 +143,16 @@ class LiveQRProcessor:
 
 
 def get_connection():
+    if "neon" not in st.secrets:
+        raise RuntimeError(
+            "Secrets do Neon nao encontrados. Configure a secao [neon] nos Secrets do Streamlit Cloud."
+        )
+
     neon_config = st.secrets["neon"]
     database_url = neon_config.get("url")
 
     if database_url:
-        return psycopg2.connect(database_url)
+        return psycopg2.connect(database_url, connect_timeout=10)
 
     return psycopg2.connect(
         host=neon_config["host"],
@@ -154,6 +160,7 @@ def get_connection():
         user=neon_config["user"],
         password=neon_config["password"],
         sslmode="require",
+        connect_timeout=10,
     )
 
 
@@ -236,6 +243,44 @@ def render_offer(data):
     st.button(f"QUERO MEU {data['name'].upper()}! 🍩")
 
 
+def render_live_scanner():
+    st.write("Clique em START e aponte a camera para o QR Code.")
+    st.caption("A leitura acontece continuamente enquanto a transmissao estiver ativa.")
+
+    webrtc_ctx = webrtc_streamer(
+        key="qr-live-reader",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
+        video_processor_factory=LiveQRProcessor,
+        async_processing=True,
+    )
+
+    if not webrtc_ctx.state.playing:
+        st.caption("A leitura ao vivo comecara quando voce clicar em START.")
+        return
+
+    st.info("Lendo QR Code em tempo real...")
+
+    if not webrtc_ctx.video_processor:
+        return
+
+    latest_code = None
+    while True:
+        try:
+            latest_code = webrtc_ctx.video_processor.result_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    if latest_code and latest_code != st.session_state.get("last_coupon_id"):
+        handle_coupon_lookup(latest_code)
+        st.rerun()
+
+
+if WEBRTC_AVAILABLE and FRAGMENT_DECORATOR is not None:
+    render_live_scanner = FRAGMENT_DECORATOR(run_every=0.5)(render_live_scanner)
+
+
 if "offer_data" not in st.session_state:
     st.session_state["offer_data"] = None
 if "last_coupon_id" not in st.session_state:
@@ -259,34 +304,13 @@ else:
 
 if WEBRTC_AVAILABLE:
     with tab_live:
-        st.write("Clique em START e aponte a camera para o QR Code.")
-        webrtc_ctx = webrtc_streamer(
-            key="qr-live-reader",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIGURATION,
-            media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
-            video_processor_factory=LiveQRProcessor,
-            async_processing=True,
-        )
-
-        live_status = st.empty()
-
-        if webrtc_ctx.state.playing:
-            live_status.info("Lendo QR Code em tempo real...")
-
-            while webrtc_ctx.state.playing:
-                if webrtc_ctx.video_processor:
-                    try:
-                        scanned_code = webrtc_ctx.video_processor.result_queue.get(timeout=1.0)
-                    except queue.Empty:
-                        scanned_code = None
-
-                    if scanned_code and scanned_code != st.session_state.get("last_coupon_id"):
-                        handle_coupon_lookup(scanned_code)
-                        break
-                time.sleep(0.1)
+        if FRAGMENT_DECORATOR is not None:
+            render_live_scanner()
         else:
-            live_status.caption("A leitura continua comecara quando voce clicar em START.")
+            st.warning(
+                "Leitura ao vivo limitada nesta versao do Streamlit. Atualize o Streamlit para uma versao com suporte a fragments para mais estabilidade."
+            )
+            render_live_scanner()
 
 with tab_upload:
     uploaded_img = st.file_uploader(

@@ -170,14 +170,26 @@ st.image(
     width=180,
 )
 st.title("Ofertas Deliciosas!")
-st.write("Envie uma imagem com o QR Code do cupom para ver o desconto exclusivo.")
+st.write("Tire uma foto ou envie uma imagem com o QR Code do cupom para ver o desconto exclusivo.")
 
-uploaded_img = st.file_uploader(
-    "Envie a foto do QR Code", type=["png", "jpg", "jpeg"]
-)
+tab_camera, tab_upload = st.tabs(["Tirar foto", "Enviar imagem"])
 
-if uploaded_img:
-    coupon_id = process_qr_code(Image.open(uploaded_img))
+camera_img = None
+uploaded_img = None
+
+with tab_camera:
+    st.caption("Use a camera e, se precisar, tire outra foto ate o QR ficar nitido.")
+    camera_img = st.camera_input("Fotografe o QR Code")
+
+with tab_upload:
+    uploaded_img = st.file_uploader(
+        "Envie a foto do QR Code", type=["png", "jpg", "jpeg"]
+    )
+
+selected_image = camera_img or uploaded_img
+
+if selected_image:
+    coupon_id = process_qr_code(Image.open(selected_image))
     if coupon_id:
         data = get_offer_data(coupon_id)
         if data:

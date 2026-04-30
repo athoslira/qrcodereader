@@ -1,14 +1,23 @@
+import queue
+import time
+
+import av
 import cv2
 import numpy as np
 import psycopg2
 import streamlit as st
 from PIL import Image
 from psycopg2.extras import RealDictCursor
+from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
 
 DUNKIN_PINK = "#E11383"
 DUNKIN_ORANGE = "#F5821F"
 DUNKIN_BROWN = "#683817"
 DUNKIN_WHITE = "#FCF6F6"
+
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
 
 st.set_page_config(page_title="Dunkin' Offers | Scanner", page_icon="🍩")
 
@@ -74,6 +83,54 @@ st.markdown(
 )
 
 
+class LiveQRProcessor:
+    def __init__(self):
+        self.detector = cv2.QRCodeDetector()
+        self.result_queue = queue.Queue()
+        self.last_sent_code = None
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+        code, points = self._read_code(image)
+
+        if points is not None:
+            pts = points.astype(int).reshape((-1, 1, 2))
+            cv2.polylines(image, [pts], True, (0, 200, 0), 3)
+
+        if code:
+            cv2.putText(
+                image,
+                f"Cupom: {code}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 200, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            if code != self.last_sent_code:
+                self.result_queue.put(code)
+                self.last_sent_code = code
+
+        return av.VideoFrame.from_ndarray(image, format="bgr24")
+
+    def _read_code(self, image):
+        try:
+            found, decoded_info, points, _ = self.detector.detectAndDecodeMulti(image)
+            if found and decoded_info:
+                for index, value in enumerate(decoded_info):
+                    code = value.strip()
+                    if code:
+                        selected_points = points[index] if points is not None else None
+                        return code, selected_points
+        except Exception:
+            pass
+
+        code, points, _ = self.detector.detectAndDecode(image)
+        clean_code = code.strip() if code else None
+        return clean_code, points
+
+
 def get_connection():
     neon_config = st.secrets["neon"]
     database_url = neon_config.get("url")
@@ -91,9 +148,6 @@ def get_connection():
 
 
 def get_offer_data(coupon_id):
-    """
-    Busca os dados do cupom e do produto no schema mostrado pelos JSONs.
-    """
     conn = None
     try:
         coupon_id = int(str(coupon_id).strip())
@@ -118,10 +172,10 @@ def get_offer_data(coupon_id):
             cur.execute(query, (coupon_id,))
             return cur.fetchone()
     except ValueError:
-        st.error("O QR Code precisa conter um ID numerico de cupom.")
+        st.session_state["scan_error"] = "O QR Code precisa conter um ID numerico de cupom."
         return None
     except Exception as exc:
-        st.error(f"Erro ao conectar com o banco: {exc}")
+        st.session_state["scan_error"] = f"Erro ao conectar com o banco: {exc}"
         return None
     finally:
         if conn is not None:
@@ -135,6 +189,48 @@ def process_qr_code(image):
     return data.strip() if data else None
 
 
+def handle_coupon_lookup(coupon_id):
+    st.session_state["last_coupon_id"] = str(coupon_id).strip()
+    st.session_state["offer_data"] = get_offer_data(coupon_id)
+    if st.session_state["offer_data"] is None and "scan_error" not in st.session_state:
+        st.session_state["scan_error"] = (
+            "Esse cupom nao foi encontrado, esta inativo ou o produto esta indisponivel."
+        )
+    elif st.session_state["offer_data"] is not None:
+        st.session_state.pop("scan_error", None)
+
+
+def render_offer(data):
+    price = float(data["price"])
+    discount_percent = float(data["discount_percent"])
+    discount_amount = price * (discount_percent / 100)
+    final_price = price - discount_amount
+
+    if data.get("image"):
+        st.image(data["image"], width=240)
+
+    st.markdown(
+        f"""
+        <div class="offer-card">
+            <span class="coupon-info">CUPOM ATIVO: {data["coupon_id"]} | {discount_percent:.0f}% OFF</span>
+            <h2 style="margin: 15px 0;">{data["name"]}</h2>
+            <p style="margin-bottom: 10px;">{data["description"]}</p>
+            <p class="price-tag-original">Preco normal: R$ {price:,.2f}</p>
+            <p style="margin:0; font-weight:bold; color:{DUNKIN_ORANGE};">COM SEU DESCONTO:</p>
+            <p class="price-tag-final">R$ {final_price:,.2f}</p>
+            <p style="color: {DUNKIN_BROWN}; font-size: 0.9rem;">Voce economiza R$ {discount_amount:,.2f} nesta oferta!</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.button(f"QUERO MEU {data['name'].upper()}! 🍩")
+
+
+if "offer_data" not in st.session_state:
+    st.session_state["offer_data"] = None
+if "last_coupon_id" not in st.session_state:
+    st.session_state["last_coupon_id"] = None
+
 st.image(
     "https://upload.wikimedia.org/wikipedia/en/thumb/d/d3/Dunkin_Donuts_logo.svg/1200px-Dunkin_Donuts_logo.svg.png",
     width=180,
@@ -142,52 +238,56 @@ st.image(
 st.title("Ofertas Deliciosas!")
 st.write("Escaneie seu cupom para ver o desconto exclusivo.")
 
-col1, col2 = st.columns(2)
+tab_live, tab_upload = st.tabs(["Leitura ao vivo", "Enviar imagem"])
 
-with col1:
-    cam_input = st.camera_input("Scanner de Cupom")
+with tab_live:
+    st.write("Clique em START e aponte a camera para o QR Code.")
+    webrtc_ctx = webrtc_streamer(
+        key="qr-live-reader",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
+        video_processor_factory=LiveQRProcessor,
+        async_processing=True,
+    )
 
-with col2:
+    live_status = st.empty()
+
+    if webrtc_ctx.state.playing:
+        live_status.info("Lendo QR Code em tempo real...")
+
+        while webrtc_ctx.state.playing:
+            if webrtc_ctx.video_processor:
+                try:
+                    scanned_code = webrtc_ctx.video_processor.result_queue.get(timeout=1.0)
+                except queue.Empty:
+                    scanned_code = None
+
+                if scanned_code and scanned_code != st.session_state.get("last_coupon_id"):
+                    handle_coupon_lookup(scanned_code)
+                    break
+            time.sleep(0.1)
+    else:
+        live_status.caption("A leitura continua comecara quando voce clicar em START.")
+
+with tab_upload:
     uploaded_img = st.file_uploader(
         "Ou envie a foto do QR Code", type=["png", "jpg", "jpeg"]
     )
+    if uploaded_img:
+        coupon_id = process_qr_code(Image.open(uploaded_img))
+        if coupon_id:
+            handle_coupon_lookup(coupon_id)
+        else:
+            st.session_state["offer_data"] = None
+            st.session_state["scan_error"] = (
+                "Nao conseguimos ler o QR Code. Tente uma imagem mais nitida."
+            )
 
-coupon_id = None
-if cam_input:
-    coupon_id = process_qr_code(Image.open(cam_input))
-elif uploaded_img:
-    coupon_id = process_qr_code(Image.open(uploaded_img))
-
-if coupon_id:
-    data = get_offer_data(coupon_id)
-
-    if data:
-        price = float(data["price"])
-        discount_percent = float(data["discount_percent"])
-        discount_amount = price * (discount_percent / 100)
-        final_price = price - discount_amount
-
-        st.markdown(
-            f"""
-            <div class="offer-card">
-                <span class="coupon-info">CUPOM ATIVO: {data["coupon_id"]} | {discount_percent:.0f}% OFF</span>
-                <h2 style="margin: 15px 0;">{data["name"]}</h2>
-                <p style="margin-bottom: 10px;">{data["description"]}</p>
-                <p class="price-tag-original">Preco normal: R$ {price:,.2f}</p>
-                <p style="margin:0; font-weight:bold; color:{DUNKIN_ORANGE};">COM SEU DESCONTO:</p>
-                <p class="price-tag-final">R$ {final_price:,.2f}</p>
-                <p style="color: {DUNKIN_BROWN}; font-size: 0.9rem;">Voce economiza R$ {discount_amount:,.2f} nesta oferta!</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.button(f"QUERO MEU {data['name'].upper()}! 🍩")
-    else:
-        st.error("Esse cupom nao foi encontrado, esta inativo ou o produto esta indisponivel.")
-else:
-    if cam_input or uploaded_img:
-        st.warning("Nao conseguimos ler o QR Code. Tente aproximar mais da camera.")
+if st.session_state.get("offer_data"):
+    render_offer(st.session_state["offer_data"])
+elif st.session_state.get("scan_error"):
+    st.error(st.session_state["scan_error"])
 
 st.markdown("---")
 st.caption("Dunkin' App | Conectado ao PostgreSQL via Neon.tech")

@@ -8,15 +8,25 @@ import psycopg2
 import streamlit as st
 from PIL import Image
 from psycopg2.extras import RealDictCursor
-from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
+
+WEBRTC_AVAILABLE = True
+WEBRTC_IMPORT_ERROR = None
+
+try:
+    from streamlit_webrtc import RTCConfiguration, WebRtcMode, webrtc_streamer
+except Exception as exc:
+    WEBRTC_AVAILABLE = False
+    WEBRTC_IMPORT_ERROR = exc
 
 DUNKIN_PINK = "#E11383"
 DUNKIN_ORANGE = "#F5821F"
 DUNKIN_BROWN = "#683817"
 DUNKIN_WHITE = "#FCF6F6"
 
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+RTC_CONFIGURATION = (
+    RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+    if WEBRTC_AVAILABLE
+    else None
 )
 
 st.set_page_config(page_title="Dunkin' Offers | Scanner", page_icon="🍩")
@@ -238,37 +248,45 @@ st.image(
 st.title("Ofertas Deliciosas!")
 st.write("Escaneie seu cupom para ver o desconto exclusivo.")
 
-tab_live, tab_upload = st.tabs(["Leitura ao vivo", "Enviar imagem"])
-
-with tab_live:
-    st.write("Clique em START e aponte a camera para o QR Code.")
-    webrtc_ctx = webrtc_streamer(
-        key="qr-live-reader",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
-        video_processor_factory=LiveQRProcessor,
-        async_processing=True,
+if WEBRTC_AVAILABLE:
+    tab_live, tab_upload = st.tabs(["Leitura ao vivo", "Enviar imagem"])
+else:
+    tab_upload = st.container()
+    st.warning(
+        "A leitura ao vivo nao esta disponivel neste deploy. O app continuara funcionando com envio de imagem."
     )
+    st.caption(f"Detalhe tecnico do ambiente: {type(WEBRTC_IMPORT_ERROR).__name__}")
 
-    live_status = st.empty()
+if WEBRTC_AVAILABLE:
+    with tab_live:
+        st.write("Clique em START e aponte a camera para o QR Code.")
+        webrtc_ctx = webrtc_streamer(
+            key="qr-live-reader",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": {"facingMode": "environment"}, "audio": False},
+            video_processor_factory=LiveQRProcessor,
+            async_processing=True,
+        )
 
-    if webrtc_ctx.state.playing:
-        live_status.info("Lendo QR Code em tempo real...")
+        live_status = st.empty()
 
-        while webrtc_ctx.state.playing:
-            if webrtc_ctx.video_processor:
-                try:
-                    scanned_code = webrtc_ctx.video_processor.result_queue.get(timeout=1.0)
-                except queue.Empty:
-                    scanned_code = None
+        if webrtc_ctx.state.playing:
+            live_status.info("Lendo QR Code em tempo real...")
 
-                if scanned_code and scanned_code != st.session_state.get("last_coupon_id"):
-                    handle_coupon_lookup(scanned_code)
-                    break
-            time.sleep(0.1)
-    else:
-        live_status.caption("A leitura continua comecara quando voce clicar em START.")
+            while webrtc_ctx.state.playing:
+                if webrtc_ctx.video_processor:
+                    try:
+                        scanned_code = webrtc_ctx.video_processor.result_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        scanned_code = None
+
+                    if scanned_code and scanned_code != st.session_state.get("last_coupon_id"):
+                        handle_coupon_lookup(scanned_code)
+                        break
+                time.sleep(0.1)
+        else:
+            live_status.caption("A leitura continua comecara quando voce clicar em START.")
 
 with tab_upload:
     uploaded_img = st.file_uploader(

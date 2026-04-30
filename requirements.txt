@@ -1,0 +1,6 @@
+streamlit
+psycopg2-binary
+opencv-python
+numpy
+Pillow
+pyzbar
